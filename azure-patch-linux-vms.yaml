@@ -1,0 +1,91 @@
+trigger: none
+
+schedules:
+  - cron: "0 2 * * 2"  # Every Tuesday at 2 AM UTC
+    displayName: Weekly Tuesday Trigger
+    branches:
+      include: [main]
+    always: true
+
+variables:
+  sshServiceConnection: 'my-linux-vm-ssh'  # Replace with your SSH service connection name
+  azureServiceConnection: 'my-azure-connection'  # Azure RM connection
+  resourceGroup: 'myRG'
+  vmName: 'myLinuxVM'
+  location: 'eastus'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+- stage: PatchStage
+  jobs:
+  - job: PatchJob
+    displayName: 'Patch Linux VM if 2nd Tuesday'
+    steps:
+
+    - task: Bash@3
+      name: CheckDay
+      displayName: 'Check if today is 2nd Tuesday'
+      inputs:
+        targetType: 'inline'
+        script: |
+          day_of_week=$(date +%u) # Monday=1, Tuesday=2...
+          week_of_month=$((($(date +%-d) - 1) / 7 + 1))
+          echo "Today is week $week_of_month, weekday $day_of_week"
+
+          if [ "$day_of_week" -eq 2 ] && [ "$week_of_month" -eq 2 ]; then
+            echo "Proceeding: This is the 2nd Tuesday"
+            echo "##vso[task.setvariable variable=should_continue]true"
+          else
+            echo "##vso[task.setvariable variable=should_continue]false"
+          fi
+
+    - task: AzureCLI@2
+      displayName: 'Take Snapshot of VM'
+      condition: and(succeeded(), eq(variables['should_continue'], 'true'))
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          timestamp=$(date +%Y%m%d%H%M%S)
+          snapshotName="snapshot-$(vmName)-$timestamp"
+          echo "Creating snapshot: $snapshotName"
+
+          az snapshot create \
+            --resource-group $(resourceGroup) \
+            --name $snapshotName \
+            --source "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$(resourceGroup)/providers/Microsoft.Compute/virtualMachines/$(vmName)" \
+            --location $(location)
+
+    - task: SSH@0
+      displayName: 'Run patch on VM'
+      condition: and(succeeded(), eq(variables['should_continue'], 'true'))
+      inputs:
+        sshEndpoint: $(sshServiceConnection)
+        runOptions: 'inline'
+        inline: |
+          echo "Patching started at $(date)"
+          sudo apt update && sudo apt upgrade -y
+          if [ -f /var/run/reboot-required ]; then
+            echo "Reboot required. Rebooting now..."
+            sudo reboot
+          fi
+          echo "Patching completed at $(date)"
+
+    - task: Bash@3
+      displayName: 'Send notification (email or webhook)'
+      condition: and(succeeded(), eq(variables['should_continue'], 'true'))
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Patching job for $(vmName) completed on $(date)" | mail -s "Patch Status: Success" team@example.com
+
+    - task: Bash@3
+      displayName: 'Skip Notification (Not 2nd Tuesday)'
+      condition: eq(variables['should_continue'], 'false')
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Not the 2nd Tuesday. Skipping patching."
